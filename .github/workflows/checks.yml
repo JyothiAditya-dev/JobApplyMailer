@@ -1,0 +1,42 @@
+name: Application checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -r requirements.txt httpx
+      - run: python -m compileall -q app
+      - name: Check the dashboard and health endpoints
+        working-directory: ${{ runner.temp }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+
+          from app.main import app
+
+          with TestClient(app) as client:
+              health = client.get("/health")
+              assert health.status_code == 200, health.text
+              assert health.json()["status"] == "running"
+
+              dashboard = client.get("/")
+              assert dashboard.status_code == 200, dashboard.text
+              assert "JobApply Mailer" in dashboard.text
+
+              stats = client.get("/api/stats")
+              assert stats.status_code == 200, stats.text
+              assert stats.json()["total_contacts"] == 0
+          PY
