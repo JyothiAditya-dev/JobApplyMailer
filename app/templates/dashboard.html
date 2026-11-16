@@ -2184,7 +2184,7 @@ async function toggleRecipientStatus(campaignId, recipientId, newStatus) {
 }
 
 async function launchCampaignSafe(id) {
-    if (!confirm(`Launch Campaign #${id}? Emails will be dispatched using the official Gmail API with throttle safety delay.`)) return;
+    if (!confirm(`Launch Campaign #${id}? Approved contacts will be sent using the configured Gmail connection.`)) return;
     try {
         showToast("Starting campaign delivery worker...", "info");
         const resp = await fetch(`/api/campaigns/${encodeURIComponent(id)}/send`, { method: "POST" });

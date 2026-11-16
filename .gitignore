@@ -44,3 +44,5 @@ uploads/resumes/*
 *.swp
 *.swo
 scratch/
+
+.campaign-delivery.lock

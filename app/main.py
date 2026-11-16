@@ -1,5 +1,6 @@
 import csv
 import io
+from math import isfinite
 import re
 import secrets
 import uuid
@@ -56,6 +57,7 @@ from app.mailer import (
     send_single_email_smtp,
     send_email_via_gmail_api,
     send_email_smart,
+    render_campaign_message,
     run_campaign_send
 )
 
@@ -842,19 +844,7 @@ async def preview_campaign(campaign_id: int):
 
     previews = []
     for recipient in campaign["recipients"]:
-        replacements = {
-            "{{recruiter_name}}": recipient.get("recipient_name") or "Hiring Team",
-            "{{sender_name}}": sender_name,
-            "{{job_role}}": "Software Engineer",
-            "{{company_name}}": "your company",
-        }
-
-        subject = campaign["template_subject"]
-        body = campaign["template_body"]
-
-        for placeholder, value in replacements.items():
-            subject = subject.replace(placeholder, value)
-            body = body.replace(placeholder, value)
+        subject, body = render_campaign_message(campaign, recipient, sender_name)
 
         previews.append({
             "recipient_id": recipient["id"],
@@ -987,6 +977,14 @@ async def fetch_settings():
 
 @app.post("/api/settings")
 async def update_settings(data: SettingsInput):
+    try:
+        delay = float(data.delay_seconds)
+        daily_limit = int(data.daily_limit)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Enter a valid sending delay and daily limit.")
+    if not isfinite(delay) or delay < 0 or daily_limit < 1:
+        raise HTTPException(status_code=400, detail="The delay must be zero or more and the daily limit must be positive.")
+
     set_setting("sender_name", data.sender_name.strip())
     set_setting("sender_email", data.sender_email.strip().lower())
     set_setting("smtp_host", data.smtp_host.strip())

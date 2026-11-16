@@ -4,17 +4,20 @@ import time
 import base64
 import mimetypes
 from pathlib import Path
+from math import isfinite
 from email.message import EmailMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
+from filelock import FileLock
 from googleapiclient.discovery import build
 
 from app.database import (
     get_all_settings,
     get_campaign,
+    get_sent_count_today,
     get_resume,
     update_campaign_status,
     update_campaign_recipient_send_status,
@@ -216,7 +219,28 @@ def test_smtp_connection(host, port, user, password, use_ssl=False):
         return False, f"Connection failed: {str(e)}"
 
 
+def render_campaign_message(campaign, recipient, sender_name):
+    replacements = {
+        "{{recruiter_name}}": recipient.get("recipient_name") or "Hiring Team",
+        "{{sender_name}}": sender_name or "Your Name",
+        "{{job_role}}": recipient.get("job_role") or "Software Engineer",
+        "{{company_name}}": recipient.get("company") or "your company",
+    }
+    subject = campaign["template_subject"]
+    body = campaign["template_body"]
+    for placeholder, value in replacements.items():
+        subject = subject.replace(placeholder, value)
+        body = body.replace(placeholder, value)
+    return subject, body
+
+
 def run_campaign_send(campaign_id: int):
+    # Serialize delivery against this app's database across worker processes.
+    with FileLock(BASE_DIR / ".campaign-delivery.lock"):
+        return _send_campaign(campaign_id)
+
+
+def _send_campaign(campaign_id: int):
     """
     Background worker that sends approved emails in a campaign batch.
     Includes rate-limiting delay between sends and full database logging.
@@ -228,6 +252,13 @@ def run_campaign_send(campaign_id: int):
         delay = float(settings.get("delay_seconds", "3"))
     except ValueError:
         delay = 3.0
+    if not isfinite(delay) or delay < 0:
+        delay = 3.0
+
+    try:
+        daily_limit = max(1, int(settings.get("daily_limit", "50")))
+    except ValueError:
+        daily_limit = 50
 
     if not is_google_connected() and not (settings.get("sender_email") and settings.get("smtp_password")):
         update_campaign_status(campaign_id, "paused")
@@ -237,8 +268,8 @@ def run_campaign_send(campaign_id: int):
     if not campaign:
         return {"error": "Campaign not found."}
 
-    # Mark campaign as sending
-    update_campaign_status(campaign_id, "sending")
+    if campaign["status"] == "cancelled":
+        return {"error": "Campaign was cancelled."}
 
     # Get resume file if available
     resume = get_resume()
@@ -256,29 +287,26 @@ def run_campaign_send(campaign_id: int):
         if r["review_status"] == "approved" and r["send_status"] != "sent"
     ]
 
+    if not recipients or not update_campaign_status(campaign_id, "sending", campaign["status"]):
+        return {"campaign_id": campaign_id, "processed": 0, "sent": 0, "failed": 0}
+
     sent_count = 0
     failed_count = 0
 
     for r in recipients:
-        # Check if campaign was paused or cancelled mid-send
         fresh = get_campaign(campaign_id)
-        if fresh and fresh["status"] in ("paused", "cancelled"):
+        if not fresh or fresh["status"] != "sending":
             break
 
-        # Personalize subject & body
-        replacements = {
-            "{{recruiter_name}}": r.get("recipient_name") or "Hiring Team",
-            "{{sender_name}}": sender_name or "Your Name",
-            "{{job_role}}": "Software Engineer",
-            "{{company_name}}": "your esteemed organization"
-        }
+        current = next((item for item in fresh["recipients"] if item["id"] == r["id"]), None)
+        if not current or current["review_status"] != "approved" or current["send_status"] == "sent":
+            continue
 
-        subject = campaign["template_subject"]
-        body = campaign["template_body"]
+        if get_sent_count_today() >= daily_limit:
+            update_campaign_status(campaign_id, "paused", "sending")
+            break
 
-        for k, v in replacements.items():
-            subject = subject.replace(k, v)
-            body = body.replace(k, v)
+        subject, body = render_campaign_message(campaign, current, sender_name)
 
         # Send email via smart dispatcher (Gmail API over HTTPS or SMTP)
         success, error_msg = send_email_smart(
@@ -309,13 +337,11 @@ def run_campaign_send(campaign_id: int):
         time.sleep(delay)
 
     # If all approved were processed, mark as completed
-    fresh = get_campaign(campaign_id)
-    if fresh and fresh["status"] == "sending":
-        update_campaign_status(campaign_id, "completed")
+    update_campaign_status(campaign_id, "completed", "sending")
 
     return {
         "campaign_id": campaign_id,
-        "processed": len(recipients),
+        "processed": sent_count + failed_count,
         "sent": sent_count,
         "failed": failed_count
     }

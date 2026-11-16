@@ -66,6 +66,33 @@ jobs:
                       assert "google_success=1" in response.headers["location"]
                       exchange.assert_called_once()
                       assert client.get(callback, params={"code": "test", "state": state}).status_code == 400
+
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from app import database, mailer
+
+          with TemporaryDirectory() as scratch, patch.object(database, "DATABASE_PATH", Path(scratch) / "test.db"):
+              database.initialize_database()
+              database.save_contacts([
+                  {"name": "First", "email": "first@example.com", "company": "Example"},
+                  {"name": "Second", "email": "second@example.com"},
+              ])
+              contacts = database.get_all_contacts()
+              template = database.create_email_template("Test", "Hello {{recruiter_name}}", "Company {{company_name}}")
+              campaign = database.create_campaign("Test", template, [contact["id"] for contact in contacts])
+              for recipient in database.get_campaign(campaign)["recipients"]:
+                  database.update_campaign_recipient_status(recipient["id"], "approved")
+
+              database.set_setting("daily_limit", "1")
+              database.set_setting("delay_seconds", "0")
+              with patch.object(mailer, "is_google_connected", return_value=True):
+                  with patch.object(mailer, "send_email_smart", return_value=(True, None)) as send:
+                      assert mailer.run_campaign_send(campaign)["sent"] == 1
+                      assert database.get_campaign(campaign)["status"] == "paused"
+                      assert mailer.run_campaign_send(campaign)["sent"] == 0
+                      send.assert_called_once()
+                      assert send.call_args.kwargs["body_text"] == "Company Example"
           PY
       - run: python -m pip install playwright
       - run: python -m playwright install --with-deps chromium
@@ -108,7 +135,7 @@ jobs:
               page.evaluate("switchTab('templates')")
               page.locator("#templateNameInput").fill("Application")
               page.locator("#templateSubjectInput").fill("Hello {{recruiter_name}}")
-              page.locator("#templateBodyInput").fill("A sample message.")
+              page.locator("#templateBodyInput").fill("Application to {{company_name}}.")
               page.locator("#btnSaveTemplate").click()
               expect(page.locator("#templatesTableBody")).to_contain_text("Application")
 
@@ -126,5 +153,6 @@ jobs:
               page.get_by_role("button", name="Preview Emails").click()
               expect(page.locator("#previewsListContainer")).to_contain_text("recruiter@example.com")
               expect(page.locator("#previewsListContainer")).to_contain_text("Hello Test Recruiter")
+              expect(page.locator("#previewsListContainer")).to_contain_text("Application to Example.")
               assert not errors, errors
           PY
