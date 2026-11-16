@@ -43,7 +43,7 @@ def load_client_secrets():
     return cfg
 
 
-def get_authorization_url(redirect_uri: str) -> str:
+def get_authorization_url(redirect_uri: str, state: str) -> str:
     """
     Constructs the official Google OAuth 2.0 authorization URL.
     """
@@ -51,6 +51,7 @@ def get_authorization_url(redirect_uri: str) -> str:
     params = {
         "client_id": cfg["client_id"],
         "redirect_uri": redirect_uri,
+        "state": state,
         "response_type": "code",
         "scope": " ".join(SCOPES),
         "access_type": "offline",

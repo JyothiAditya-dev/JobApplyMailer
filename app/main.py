@@ -1,10 +1,13 @@
 import csv
 import io
+from math import isfinite
 import re
+import secrets
 import uuid
 import sqlite3
 from pathlib import Path
 from typing import List, Literal, Optional
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
@@ -18,6 +21,7 @@ from app.database import (
     get_all_contacts,
     get_contact_count,
     delete_contact,
+    delete_all_contacts,
     save_resume,
     get_resume,
     delete_resume,
@@ -41,7 +45,7 @@ from app.database import (
     get_total_sent_count
 )
 from app.google_auth import (
-    CLIENT_SECRET_FILE,
+    load_client_secrets,
     is_google_connected,
     get_authenticated_user_info,
     get_authorization_url,
@@ -53,6 +57,7 @@ from app.mailer import (
     send_single_email_smtp,
     send_email_via_gmail_api,
     send_email_smart,
+    render_campaign_message,
     run_campaign_send
 )
 
@@ -66,7 +71,7 @@ app = FastAPI(
     version="2.2.0",
 )
 
-templates = Jinja2Templates(directory="app/templates")
+templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 
 MAX_FILE_SIZE = 5 * 1024 * 1024
 MAX_ROWS = 5000
@@ -85,6 +90,13 @@ initialize_database()
 # --------------------------------------------------
 # REQUEST MODELS
 # --------------------------------------------------
+
+class ContactInput(BaseModel):
+    name: str = Field(default="", max_length=150)
+    email: str = Field(min_length=3, max_length=254)
+    company: str = Field(default="", max_length=150)
+    job_role: str = Field(default="", max_length=150)
+
 
 class EmailTemplateInput(BaseModel):
     template_name: str = Field(min_length=1, max_length=100)
@@ -191,6 +203,10 @@ async def get_stats():
 # GOOGLE OAUTH 2.0 (OFFICIAL GMAIL API)
 # --------------------------------------------------
 
+OAUTH_STATE_COOKIE = "gmail_oauth_state"
+OAUTH_COOKIE_PATH = "/api/auth/google"
+
+
 def get_oauth_redirect_uri(request: Request) -> str:
     # 1. Custom app URL from environment variable (e.g. Render / Railway / Production domain)
     import os
@@ -214,10 +230,16 @@ def get_oauth_redirect_uri(request: Request) -> str:
 async def get_google_auth_status():
     connected = is_google_connected()
     user = get_authenticated_user_info() if connected else None
+    try:
+        config = load_client_secrets()
+        client_configured = bool(config.get("client_id") and config.get("client_secret"))
+    except (OSError, ValueError):
+        client_configured = False
+
     return {
         "connected": connected,
         "user": user,
-        "client_secret_exists": CLIENT_SECRET_FILE.is_file()
+        "client_secret_exists": client_configured,
     }
 
 
@@ -227,33 +249,53 @@ async def google_login_redirect(request: Request):
     Redirects the user directly to Google's official authorization screen.
     """
     redirect_uri = get_oauth_redirect_uri(request)
+    callback = urlsplit(redirect_uri)
+    if request.url.hostname == "127.0.0.1" and callback.hostname == "localhost":
+        return RedirectResponse(f"{callback.scheme}://{callback.netloc}{OAUTH_COOKIE_PATH}/login")
+
+    state = secrets.token_urlsafe(32)
     try:
-        auth_url = get_authorization_url(redirect_uri)
-        return RedirectResponse(url=auth_url)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        auth_url = get_authorization_url(redirect_uri, state)
+    except (OSError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    response = RedirectResponse(auth_url)
+    response.set_cookie(
+        OAUTH_STATE_COOKIE,
+        state,
+        max_age=600,
+        path=OAUTH_COOKIE_PATH,
+        secure=callback.scheme == "https",
+        httponly=True,
+        samesite="lax",
+    )
+    return response
 
 
 @app.get("/api/auth/google/callback")
-async def google_auth_callback(request: Request, code: Optional[str] = None, error: Optional[str] = None):
-    """
-    Handles redirect back from Google authorization screen.
-    Exchanges code for tokens, saves credentials, and redirects back to dashboard.
-    """
-    if error:
-        return RedirectResponse(url=f"/#settings?google_error={error}")
+async def google_auth_callback(
+    request: Request,
+    code: Optional[str] = None,
+    error: Optional[str] = None,
+    state: Optional[str] = None,
+):
+    """Validate the login attempt and redirect to the dashboard."""
+    expected_state = request.cookies.get(OAUTH_STATE_COOKIE)
+    if not state or not expected_state or not secrets.compare_digest(state.encode(), expected_state.encode()):
+        raise HTTPException(status_code=400, detail="Invalid or expired Google login session. Start again from Settings.")
 
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing authorization code from Google.")
+    if error or not code:
+        params = {"google_error": error or "Missing authorization code from Google."}
+    else:
+        try:
+            user_info = exchange_code_for_token(code=code, redirect_uri=get_oauth_redirect_uri(request))
+            params = {"google_success": "1", "email": user_info.get("email") or ""}
+        except Exception as error:
+            params = {"google_error": str(error)}
 
-    redirect_uri = get_oauth_redirect_uri(request)
-
-    try:
-        user_info = exchange_code_for_token(code=code, redirect_uri=redirect_uri)
-        email = user_info.get("email", "")
-        return RedirectResponse(url=f"/#settings?google_success=1&email={email}")
-    except Exception as e:
-        return RedirectResponse(url=f"/#settings?google_error={str(e)}")
+    response = RedirectResponse(url=f"/#settings?{urlencode(params)}")
+    response.delete_cookie(OAUTH_STATE_COOKIE, path=OAUTH_COOKIE_PATH)
+    return response
 
 
 @app.post("/api/auth/google/disconnect")
@@ -315,6 +357,28 @@ async def list_contacts():
 async def search_contacts(q: str = ""):
     contacts = get_all_contacts(q.strip())
     return {"total_contacts": len(contacts), "contacts": contacts}
+
+
+@app.post("/api/contacts/manual")
+async def add_contact(data: ContactInput):
+    email = data.email.strip().lower()
+    if not EMAIL_PATTERN.fullmatch(email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    saved, _ = save_contacts([{
+        "name": data.name.strip(),
+        "email": email,
+        "company": data.company.strip(),
+        "job_role": data.job_role.strip(),
+    }])
+    if not saved:
+        raise HTTPException(status_code=409, detail="A contact with this email already exists.")
+    return {"message": "Contact added successfully."}
+
+
+@app.delete("/api/contacts")
+async def clear_contacts():
+    return {"deleted_count": delete_all_contacts()}
 
 
 @app.delete("/api/contacts/{contact_id}")
@@ -390,6 +454,9 @@ async def upload_contacts(file: UploadFile = File(...)):
         None,
     )
 
+    company_index = next((i for i, header in enumerate(headers) if header in ("company", "company name")), None)
+    role_index = next((i for i, header in enumerate(headers) if header in ("role", "job role")), None)
+
     contacts = []
     seen = set()
     invalid = 0
@@ -416,7 +483,12 @@ async def upload_contacts(file: UploadFile = File(...)):
         if name_index is not None and name_index < len(row):
             name = str(row[name_index] or "").strip()
 
-        contacts.append({"name": name, "email": email})
+        contacts.append({
+            "name": name,
+            "email": email,
+            "company": str(row[company_index] or "").strip() if company_index is not None and company_index < len(row) else "",
+            "job_role": str(row[role_index] or "").strip() if role_index is not None and role_index < len(row) else "",
+        })
 
     if not contacts:
         raise HTTPException(
@@ -772,19 +844,7 @@ async def preview_campaign(campaign_id: int):
 
     previews = []
     for recipient in campaign["recipients"]:
-        replacements = {
-            "{{recruiter_name}}": recipient.get("recipient_name") or "Hiring Team",
-            "{{sender_name}}": sender_name,
-            "{{job_role}}": "Software Engineer",
-            "{{company_name}}": "your company",
-        }
-
-        subject = campaign["template_subject"]
-        body = campaign["template_body"]
-
-        for placeholder, value in replacements.items():
-            subject = subject.replace(placeholder, value)
-            body = body.replace(placeholder, value)
+        subject, body = render_campaign_message(campaign, recipient, sender_name)
 
         previews.append({
             "recipient_id": recipient["id"],
@@ -917,6 +977,14 @@ async def fetch_settings():
 
 @app.post("/api/settings")
 async def update_settings(data: SettingsInput):
+    try:
+        delay = float(data.delay_seconds)
+        daily_limit = int(data.daily_limit)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Enter a valid sending delay and daily limit.")
+    if not isfinite(delay) or delay < 0 or daily_limit < 1:
+        raise HTTPException(status_code=400, detail="The delay must be zero or more and the daily limit must be positive.")
+
     set_setting("sender_name", data.sender_name.strip())
     set_setting("sender_email", data.sender_email.strip().lower())
     set_setting("smtp_host", data.smtp_host.strip())

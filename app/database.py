@@ -29,9 +29,17 @@ def initialize_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT,
                 email TEXT NOT NULL UNIQUE,
+                company TEXT NOT NULL DEFAULT '',
+                job_role TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        contact_columns = {row["name"] for row in connection.execute("PRAGMA table_info(contacts)")}
+        if "company" not in contact_columns:
+            connection.execute("ALTER TABLE contacts ADD COLUMN company TEXT NOT NULL DEFAULT ''")
+        if "job_role" not in contact_columns:
+            connection.execute("ALTER TABLE contacts ADD COLUMN job_role TEXT NOT NULL DEFAULT ''")
 
         # Resumes table
         connection.execute("""
@@ -81,6 +89,8 @@ def initialize_database():
                 contact_id INTEGER,
                 recipient_name TEXT,
                 recipient_email TEXT NOT NULL,
+                company TEXT NOT NULL DEFAULT '',
+                job_role TEXT NOT NULL DEFAULT '',
                 review_status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (review_status IN ('pending', 'approved', 'suppressed')),
                 send_status TEXT NOT NULL DEFAULT 'unattempted'
@@ -143,6 +153,10 @@ def initialize_database():
         # 1. Check campaign_recipients columns
         cursor = connection.execute("PRAGMA table_info(campaign_recipients)")
         existing_cols = {row["name"] for row in cursor.fetchall()}
+        if "company" not in existing_cols:
+            connection.execute("ALTER TABLE campaign_recipients ADD COLUMN company TEXT NOT NULL DEFAULT ''")
+        if "job_role" not in existing_cols:
+            connection.execute("ALTER TABLE campaign_recipients ADD COLUMN job_role TEXT NOT NULL DEFAULT ''")
         if "send_status" not in existing_cols:
             connection.execute("ALTER TABLE campaign_recipients ADD COLUMN send_status TEXT NOT NULL DEFAULT 'unattempted'")
         if "sent_at" not in existing_cols:
@@ -192,9 +206,9 @@ def save_contacts(contacts):
     with get_connection() as connection:
         for contact in contacts:
             cursor = connection.execute("""
-                INSERT OR IGNORE INTO contacts (name, email)
-                VALUES (?, ?)
-            """, (contact["name"], contact["email"]))
+                INSERT OR IGNORE INTO contacts (name, email, company, job_role)
+                VALUES (?, ?, ?, ?)
+            """, (contact["name"], contact["email"], contact.get("company", ""), contact.get("job_role", "")))
 
             if cursor.rowcount == 1:
                 saved_count += 1
@@ -208,14 +222,14 @@ def get_all_contacts(search=""):
     with get_connection() as connection:
         if search:
             rows = connection.execute("""
-                SELECT id, name, email, created_at
+                SELECT id, name, email, company, job_role, created_at
                 FROM contacts
                 WHERE name LIKE ? OR email LIKE ?
                 ORDER BY id DESC
             """, (f"%{search}%", f"%{search}%")).fetchall()
         else:
             rows = connection.execute("""
-                SELECT id, name, email, created_at
+                SELECT id, name, email, company, job_role, created_at
                 FROM contacts
                 ORDER BY id DESC
             """).fetchall()
@@ -229,6 +243,11 @@ def get_contact_count():
             "SELECT COUNT(*) FROM contacts"
         ).fetchone()
     return result[0]
+
+
+def delete_all_contacts():
+    with get_connection() as connection:
+        return connection.execute("DELETE FROM contacts").rowcount
 
 
 def delete_contact(contact_id):
@@ -371,7 +390,7 @@ def create_campaign(campaign_name, template_id, contact_ids):
 
         placeholders = ",".join("?" for _ in unique_ids)
         contacts = connection.execute(
-            f"""SELECT id, name, email FROM contacts
+            f"""SELECT id, name, email, company, job_role FROM contacts
                 WHERE id IN ({placeholders}) ORDER BY id""",
             unique_ids
         ).fetchall()
@@ -393,14 +412,16 @@ def create_campaign(campaign_name, template_id, contact_ids):
         for contact in contacts:
             connection.execute("""
                 INSERT INTO campaign_recipients (
-                    campaign_id, contact_id, recipient_name, recipient_email
+                    campaign_id, contact_id, recipient_name, recipient_email, company, job_role
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 campaign_id,
                 contact["id"],
                 contact["name"],
-                contact["email"]
+                contact["email"],
+                contact["company"],
+                contact["job_role"],
             ))
 
     return campaign_id
@@ -452,7 +473,7 @@ def get_campaign(campaign_id):
             return None
 
         recipients = connection.execute("""
-            SELECT id, contact_id, recipient_name, recipient_email,
+            SELECT id, contact_id, recipient_name, recipient_email, company, job_role,
                    review_status, send_status, sent_at, error_message, created_at
             FROM campaign_recipients
             WHERE campaign_id = ?
@@ -464,7 +485,7 @@ def get_campaign(campaign_id):
     return result
 
 
-def update_campaign_status(campaign_id, status):
+def update_campaign_status(campaign_id, status, expected_status=None):
     allowed_statuses = {"draft", "review", "sending", "completed", "paused", "cancelled"}
     if status not in allowed_statuses:
         raise ValueError("Invalid campaign status.")
@@ -473,8 +494,8 @@ def update_campaign_status(campaign_id, status):
         cursor = connection.execute("""
             UPDATE campaigns
             SET status = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (status, campaign_id))
+            WHERE id = ? AND (? IS NULL OR status = ?)
+        """, (status, campaign_id, expected_status, expected_status))
     return cursor.rowcount > 0
 
 
@@ -622,3 +643,12 @@ def get_total_sent_count():
             SELECT COUNT(*) FROM email_logs WHERE status = 'sent'
         """).fetchone()
     return result[0]
+
+
+
+def get_sent_count_today():
+    with get_connection() as connection:
+        return connection.execute("""
+            SELECT COUNT(*) FROM email_logs
+            WHERE status = 'sent' AND sent_at >= date('now')
+        """).fetchone()[0]

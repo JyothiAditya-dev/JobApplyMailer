@@ -1,0 +1,158 @@
+name: Application checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -r requirements.txt httpx
+      - run: python -m compileall -q app
+      - name: Check the dashboard and health endpoints
+        working-directory: ${{ runner.temp }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from unittest.mock import patch
+          from urllib.parse import parse_qs, urlsplit
+
+          from fastapi.testclient import TestClient
+
+          from app.main import app
+
+          with TestClient(app, base_url="http://localhost:8000") as client:
+              health = client.get("/health")
+              assert health.status_code == 200, health.text
+              assert health.json()["status"] == "running"
+
+              dashboard = client.get("/")
+              assert dashboard.status_code == 200, dashboard.text
+              assert "JobApply Mailer" in dashboard.text
+
+              stats = client.get("/api/stats")
+              assert stats.status_code == 200, stats.text
+              assert stats.json()["total_contacts"] == 0
+
+              oauth_config = json.dumps({"web": {"client_id": "test-client", "client_secret": "test-secret"}})
+              with patch.dict(os.environ, {"GOOGLE_CLIENT_SECRET_JSON": oauth_config}):
+                  status = client.get("/api/auth/google/status")
+                  assert status.json()["client_secret_exists"]
+
+                  login = client.get("/api/auth/google/login", follow_redirects=False)
+                  assert login.status_code == 307, login.text
+                  state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+                  assert state
+
+                  callback = "/api/auth/google/callback"
+                  with patch("app.main.exchange_code_for_token", return_value={"email": "user@example.com"}) as exchange:
+                      assert client.get(callback, params={"code": "test"}).status_code == 400
+                      assert client.get(callback, params={"code": "test", "state": "wrong"}).status_code == 400
+                      exchange.assert_not_called()
+
+                      response = client.get(callback, params={"code": "test", "state": state}, follow_redirects=False)
+                      assert response.status_code == 307, response.text
+                      assert "google_success=1" in response.headers["location"]
+                      exchange.assert_called_once()
+                      assert client.get(callback, params={"code": "test", "state": state}).status_code == 400
+
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from app import database, mailer
+
+          with TemporaryDirectory() as scratch, patch.object(database, "DATABASE_PATH", Path(scratch) / "test.db"):
+              database.initialize_database()
+              database.save_contacts([
+                  {"name": "First", "email": "first@example.com", "company": "Example"},
+                  {"name": "Second", "email": "second@example.com"},
+              ])
+              contacts = database.get_all_contacts()
+              template = database.create_email_template("Test", "Hello {{recruiter_name}}", "Company {{company_name}}")
+              campaign = database.create_campaign("Test", template, [contact["id"] for contact in contacts])
+              for recipient in database.get_campaign(campaign)["recipients"]:
+                  database.update_campaign_recipient_status(recipient["id"], "approved")
+
+              database.set_setting("daily_limit", "1")
+              database.set_setting("delay_seconds", "0")
+              with patch.object(mailer, "is_google_connected", return_value=True):
+                  with patch.object(mailer, "send_email_smart", return_value=(True, None)) as send:
+                      assert mailer.run_campaign_send(campaign)["sent"] == 1
+                      assert database.get_campaign(campaign)["status"] == "paused"
+                      assert mailer.run_campaign_send(campaign)["sent"] == 0
+                      send.assert_called_once()
+                      assert send.call_args.kwargs["body_text"] == "Company Example"
+          PY
+      - run: python -m pip install playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: Exercise contacts, templates, resume, and campaign review in a browser
+        run: |
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/dashboard.log 2>&1 &
+          server=$!
+          trap 'kill "$server"; cat /tmp/dashboard.log' EXIT
+          for attempt in {1..30}; do
+            if curl --silent --fail http://127.0.0.1:8000/health > /dev/null; then break; fi
+            sleep 1
+          done
+          python - <<'PY'
+          from playwright.sync_api import expect, sync_playwright
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch()
+              page = browser.new_page()
+              errors = []
+              page.on("pageerror", lambda error: errors.append(str(error)))
+              page.route("https://fonts.googleapis.com/**", lambda route: route.abort())
+              page.goto("http://127.0.0.1:8000/")
+              page.evaluate("switchTab('contacts')")
+              page.get_by_role("button", name="Add Single").click()
+              page.locator("#manualName").fill("Test Recruiter")
+              page.locator("#manualEmail").fill("recruiter@example.com")
+              page.locator("#manualCompany").fill("Example")
+              page.get_by_role("button", name="Save Contact").click()
+              expect(page.locator("#contactsTableBody")).to_contain_text("recruiter@example.com")
+              expect(page.locator("#contactsTableBody")).to_contain_text("Example")
+
+              page.evaluate("switchTab('resume')")
+              expect(page.locator("#resumeUploadSection")).to_be_visible()
+              expect(page.locator("#activeResumeContainer")).to_be_hidden()
+              page.locator("#resumeFileInput").set_input_files(
+                  {"name": "resume.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4 fixture"}
+              )
+              expect(page.locator("#resumeOriginalName")).to_have_text("resume.pdf")
+
+              page.evaluate("switchTab('templates')")
+              page.locator("#templateNameInput").fill("Application")
+              page.locator("#templateSubjectInput").fill("Hello {{recruiter_name}}")
+              page.locator("#templateBodyInput").fill("Application to {{company_name}}.")
+              page.locator("#btnSaveTemplate").click()
+              expect(page.locator("#templatesTableBody")).to_contain_text("Application")
+
+              page.evaluate("switchTab('campaigns')")
+              page.get_by_role("button", name="Create New Campaign").click()
+              page.locator("#campaignNameField").fill("Smoke test campaign")
+              page.locator("#campaignTemplateSelect").select_option(index=1)
+              page.locator(".campaign-contact-chk").check()
+              page.locator("#btnCreateCampaign").click()
+              expect(page.locator("#campaignsTableBody")).to_contain_text("1 recipients")
+              expect(page.locator("#detailCampaignTitle")).to_contain_text("Smoke test campaign")
+
+              page.get_by_role("button", name="Approve", exact=True).click()
+              expect(page.locator("#detailRecipientsTable")).to_contain_text("approved")
+              page.get_by_role("button", name="Preview Emails").click()
+              expect(page.locator("#previewsListContainer")).to_contain_text("recruiter@example.com")
+              expect(page.locator("#previewsListContainer")).to_contain_text("Hello Test Recruiter")
+              expect(page.locator("#previewsListContainer")).to_contain_text("Application to Example.")
+              assert not errors, errors
+          PY
