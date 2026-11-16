@@ -41,7 +41,7 @@ from app.database import (
     get_total_sent_count
 )
 from app.google_auth import (
-    CLIENT_SECRET_FILE,
+    load_client_secrets,
     is_google_connected,
     get_authenticated_user_info,
     get_authorization_url,
@@ -66,7 +66,7 @@ app = FastAPI(
     version="2.2.0",
 )
 
-templates = Jinja2Templates(directory="app/templates")
+templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 
 MAX_FILE_SIZE = 5 * 1024 * 1024
 MAX_ROWS = 5000
@@ -214,10 +214,16 @@ def get_oauth_redirect_uri(request: Request) -> str:
 async def get_google_auth_status():
     connected = is_google_connected()
     user = get_authenticated_user_info() if connected else None
+    try:
+        config = load_client_secrets()
+        client_configured = bool(config.get("client_id") and config.get("client_secret"))
+    except (OSError, ValueError):
+        client_configured = False
+
     return {
         "connected": connected,
         "user": user,
-        "client_secret_exists": CLIENT_SECRET_FILE.is_file()
+        "client_secret_exists": client_configured,
     }
 
 

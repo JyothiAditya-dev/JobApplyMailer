@@ -32,16 +32,18 @@ JobApply Mailer helps software engineers and job seekers organize recruiter lead
 
 ## 🚀 Quickstart Guide
 
-### 1. Open Terminal & Navigate to Project
+### 1. Install dependencies
 
-```powershell
-cd C:\Users\adity\JobApplyMailer
+From the repository root, run the following with Python 3.10 or later.
+
+```sh
+python -m pip install -r requirements.txt
 ```
 
-### 2. Activate Virtual Environment (or run directly)
+### 2. Start the application
 
-```powershell
-.\venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```sh
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 ### 3. Open the Dashboard
