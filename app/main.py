@@ -1,10 +1,12 @@
 import csv
 import io
 import re
+import secrets
 import uuid
 import sqlite3
 from pathlib import Path
 from typing import List, Literal, Optional
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
@@ -191,6 +193,10 @@ async def get_stats():
 # GOOGLE OAUTH 2.0 (OFFICIAL GMAIL API)
 # --------------------------------------------------
 
+OAUTH_STATE_COOKIE = "gmail_oauth_state"
+OAUTH_COOKIE_PATH = "/api/auth/google"
+
+
 def get_oauth_redirect_uri(request: Request) -> str:
     # 1. Custom app URL from environment variable (e.g. Render / Railway / Production domain)
     import os
@@ -233,33 +239,53 @@ async def google_login_redirect(request: Request):
     Redirects the user directly to Google's official authorization screen.
     """
     redirect_uri = get_oauth_redirect_uri(request)
+    callback = urlsplit(redirect_uri)
+    if request.url.hostname == "127.0.0.1" and callback.hostname == "localhost":
+        return RedirectResponse(f"{callback.scheme}://{callback.netloc}{OAUTH_COOKIE_PATH}/login")
+
+    state = secrets.token_urlsafe(32)
     try:
-        auth_url = get_authorization_url(redirect_uri)
-        return RedirectResponse(url=auth_url)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        auth_url = get_authorization_url(redirect_uri, state)
+    except (OSError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    response = RedirectResponse(auth_url)
+    response.set_cookie(
+        OAUTH_STATE_COOKIE,
+        state,
+        max_age=600,
+        path=OAUTH_COOKIE_PATH,
+        secure=callback.scheme == "https",
+        httponly=True,
+        samesite="lax",
+    )
+    return response
 
 
 @app.get("/api/auth/google/callback")
-async def google_auth_callback(request: Request, code: Optional[str] = None, error: Optional[str] = None):
-    """
-    Handles redirect back from Google authorization screen.
-    Exchanges code for tokens, saves credentials, and redirects back to dashboard.
-    """
-    if error:
-        return RedirectResponse(url=f"/#settings?google_error={error}")
+async def google_auth_callback(
+    request: Request,
+    code: Optional[str] = None,
+    error: Optional[str] = None,
+    state: Optional[str] = None,
+):
+    """Validate the login attempt and redirect to the dashboard."""
+    expected_state = request.cookies.get(OAUTH_STATE_COOKIE)
+    if not state or not expected_state or not secrets.compare_digest(state.encode(), expected_state.encode()):
+        raise HTTPException(status_code=400, detail="Invalid or expired Google login session. Start again from Settings.")
 
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing authorization code from Google.")
+    if error or not code:
+        params = {"google_error": error or "Missing authorization code from Google."}
+    else:
+        try:
+            user_info = exchange_code_for_token(code=code, redirect_uri=get_oauth_redirect_uri(request))
+            params = {"google_success": "1", "email": user_info.get("email") or ""}
+        except Exception as error:
+            params = {"google_error": str(error)}
 
-    redirect_uri = get_oauth_redirect_uri(request)
-
-    try:
-        user_info = exchange_code_for_token(code=code, redirect_uri=redirect_uri)
-        email = user_info.get("email", "")
-        return RedirectResponse(url=f"/#settings?google_success=1&email={email}")
-    except Exception as e:
-        return RedirectResponse(url=f"/#settings?google_error={str(e)}")
+    response = RedirectResponse(url=f"/#settings?{urlencode(params)}")
+    response.delete_cookie(OAUTH_STATE_COOKIE, path=OAUTH_COOKIE_PATH)
+    return response
 
 
 @app.post("/api/auth/google/disconnect")
