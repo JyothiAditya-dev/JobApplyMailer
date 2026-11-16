@@ -986,7 +986,7 @@ tr:hover td { background: rgba(248, 250, 252, 0.7); }
                     <h4 style="margin: 0 0 8px 0;">Upload Contacts Spreadsheet</h4>
                     <p class="muted" style="margin: 0 0 16px 0;">Supports <code>.xlsx</code>, <code>.xls</code>, or <code>.csv</code>. Auto-detects columns: <strong>Name</strong>, <strong>Email</strong>, <strong>Company</strong>, <strong>Job Role</strong>.</p>
                     <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
-                        <input type="file" id="contactsFile" accept=".csv,.xlsx,.xls" required style="flex: 1; padding: 10px; background: white;">
+                        <input type="file" id="contactsFile" accept=".csv,.xlsx" required style="flex: 1; padding: 10px; background: white;">
                         <button type="submit" id="btnUploadContacts" class="btn btn-primary">Process & Import</button>
                         <button type="button" class="btn btn-secondary" onclick="document.getElementById('contactUploadBox').hidden = true;">Cancel</button>
                     </div>
@@ -1104,7 +1104,7 @@ tr:hover td { background: rgba(248, 250, 252, 0.7); }
                 <p class="muted" style="margin: 0 auto 20px auto; max-width: 450px; font-size: 14px;">Select your latest PDF or Word Document. Maximum file size: 10 MB.</p>
 
                 <form id="resumeUploadForm" style="display: inline-block;">
-                    <input type="file" id="resumeFileInput" accept=".pdf,.docx,.doc" style="display: none;" onchange="handleResumeFileSelected(this)">
+                    <input type="file" id="resumeFileInput" accept=".pdf,.docx" style="display: none;" onchange="handleResumeFileSelected(this)">
                     <button type="button" class="btn btn-primary" onclick="document.getElementById('resumeFileInput').click()">
                         Select Resume File
                     </button>
@@ -1575,7 +1575,10 @@ async function loadGoogleStatus() {
             desc.innerHTML = `Successfully authorized as <strong>${escapeHtml(email)}</strong> (${escapeHtml(name)}). All emails are sent via Google Cloud HTTPS (Port 443).`;
 
             if (pic) {
-                document.getElementById("sidebarAvatar").innerHTML = `<img src="${pic}" alt="avatar">`;
+                const image = document.createElement("img");
+                image.src = pic;
+                image.alt = "Google profile avatar";
+                document.getElementById("sidebarAvatar").replaceChildren(image);
             }
 
             container.innerHTML = `
@@ -1672,7 +1675,8 @@ function checkGoogleUrlParams() {
 async function loadContacts() {
     try {
         const resp = await fetch("/api/contacts");
-        allContacts = await resp.json();
+        if (!resp.ok) throw new Error("Could not load contacts");
+        allContacts = (await resp.json()).contacts;
         filteredContacts = [...allContacts];
         contactPage = 1;
         renderContactsTable();
@@ -1828,11 +1832,11 @@ async function loadResume() {
         const activeContainer = document.getElementById("activeResumeContainer");
         const uploadSection = document.getElementById("resumeUploadSection");
 
-        if (resp.ok && data) {
+        if (resp.ok && data.uploaded) {
             activeContainer.style.display = "block";
             uploadSection.style.display = "none";
-            document.getElementById("resumeOriginalName").textContent = data.original_filename;
-            document.getElementById("resumeMeta").textContent = `Size: ${(data.file_size / 1024).toFixed(1)} KB | Uploaded: ${data.uploaded_at}`;
+            document.getElementById("resumeOriginalName").textContent = data.resume.filename;
+            document.getElementById("resumeMeta").textContent = `Size: ${(data.resume.file_size / 1024).toFixed(1)} KB | Uploaded: ${data.resume.uploaded_at}`;
             document.getElementById("navResumeBadge").textContent = "Ready";
         } else {
             activeContainer.style.display = "none";
@@ -1882,8 +1886,9 @@ async function deleteResumeFile() {
 // --------------------------------------------------
 async function loadTemplates() {
     try {
-        const resp = await fetch("/api/templates");
-        allTemplates = await resp.json();
+        const resp = await fetch("/api/email-templates");
+        if (!resp.ok) throw new Error("Could not load templates");
+        allTemplates = (await resp.json()).templates;
         renderTemplatesTable();
         populateCampaignTemplateDropdown();
     } catch (e) {
@@ -1952,7 +1957,7 @@ function previewTemplateModal(id) {
 async function removeTemplateItem(id) {
     if (!confirm(`Delete template #${id}?`)) return;
     try {
-        const resp = await fetch(`/api/templates/${encodeURIComponent(id)}`, { method: "DELETE" });
+        const resp = await fetch(`/api/email-templates/${encodeURIComponent(id)}`, { method: "DELETE" });
         if (!resp.ok) throw new Error("Delete failed");
         showToast("Template deleted.", "info");
         await loadTemplates();
@@ -1972,7 +1977,7 @@ document.getElementById("templateEditorForm").addEventListener("submit", async (
     };
 
     const isEdit = Boolean(editId);
-    const url = isEdit ? `/api/templates/${encodeURIComponent(editId)}` : "/api/templates";
+    const url = isEdit ? `/api/email-templates/${encodeURIComponent(editId)}` : "/api/email-templates";
     const method = isEdit ? "PUT" : "POST";
 
     try {
@@ -2051,7 +2056,7 @@ document.getElementById("newCampaignForm").addEventListener("submit", async (e) 
         toggleAllCampaignContacts(false);
         await loadCampaigns();
         await loadDashboardStats();
-        viewCampaignDetail(data.id);
+        await viewCampaignDetail(data.campaign_id);
     } catch (e) {
         showToast(e.message, "error");
     }
@@ -2060,7 +2065,8 @@ document.getElementById("newCampaignForm").addEventListener("submit", async (e) 
 async function loadCampaigns() {
     try {
         const resp = await fetch("/api/campaigns");
-        allCampaigns = await resp.json();
+        if (!resp.ok) throw new Error("Could not load campaigns");
+        allCampaigns = (await resp.json()).campaigns;
         renderCampaignsTables();
     } catch (e) {
         console.error("Error loading campaigns:", e);
@@ -2085,12 +2091,12 @@ function renderCampaignsTables() {
                 <td><span class="badge badge-neutral">#${c.id}</span></td>
                 <td><strong>${escapeHtml(c.campaign_name)}</strong></td>
                 <td>${escapeHtml(c.template_name || 'Template #' + c.template_id)}</td>
-                <td>${c.total_recipients} recipients</td>
+                <td>${c.recipient_count} recipients</td>
                 <td>
                     <div style="background: #e2e8f0; border-radius: 999px; height: 6px; width: 80px; overflow: hidden;">
-                        <div style="background: #10b981; height: 100%; width: ${c.total_recipients ? (c.sent_count / c.total_recipients * 100) : 0}%;"></div>
+                        <div style="background: #10b981; height: 100%; width: ${c.recipient_count ? (c.sent_count / c.recipient_count * 100) : 0}%;"></div>
                     </div>
-                    <span style="font-size: 11px; color: var(--text-muted);">${c.sent_count}/${c.total_recipients} sent</span>
+                    <span style="font-size: 11px; color: var(--text-muted);">${c.sent_count}/${c.recipient_count} sent</span>
                 </td>
                 <td><span class="badge ${badgeClass}">${c.status}</span></td>
                 <td style="font-size: 12px;">${c.created_at ? c.created_at.slice(0, 10) : ''}</td>
@@ -2106,7 +2112,7 @@ function renderCampaignsTables() {
         <tr>
             <td><strong>${escapeHtml(c.campaign_name)}</strong></td>
             <td>${escapeHtml(c.template_name || 'Template')}</td>
-            <td>${c.total_recipients}</td>
+            <td>${c.recipient_count}</td>
             <td><span class="badge ${c.status === 'completed' ? 'badge-success' : 'badge-neutral'}">${c.status}</span></td>
             <td>${c.created_at ? c.created_at.slice(0, 10) : ''}</td>
         </tr>
@@ -2129,7 +2135,7 @@ async function viewCampaignDetail(id) {
         pill.className = `badge ${c.status === 'completed' ? 'badge-success' : (c.status === 'sending' ? 'badge-info' : 'badge-neutral')}`;
         pill.textContent = c.status;
 
-        document.getElementById("detailCampaignMeta").textContent = `Template: ${c.template_name} | Total Recipients: ${c.recipients.length} | Sent: ${c.sent_count} | Failed: ${c.failed_count}`;
+        document.getElementById("detailCampaignMeta").textContent = `Template: ${c.template_name} | Total Recipients: ${c.recipients.length} | Sent: ${c.recipients.filter(r => r.send_status === 'sent').length} | Failed: ${c.recipients.filter(r => r.send_status === 'failed').length}`;
 
         // Action buttons
         const actionsBox = document.getElementById("detailActionButtons");
@@ -2165,8 +2171,8 @@ async function viewCampaignDetail(id) {
 
 async function toggleRecipientStatus(campaignId, recipientId, newStatus) {
     try {
-        const resp = await fetch(`/api/campaigns/${encodeURIComponent(campaignId)}/recipients/${encodeURIComponent(recipientId)}/review`, {
-            method: "POST",
+        const resp = await fetch(`/api/campaigns/recipients/${encodeURIComponent(recipientId)}/review`, {
+            method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ review_status: newStatus })
         });
@@ -2181,7 +2187,7 @@ async function launchCampaignSafe(id) {
     if (!confirm(`Launch Campaign #${id}? Emails will be dispatched using the official Gmail API with throttle safety delay.`)) return;
     try {
         showToast("Starting campaign delivery worker...", "info");
-        const resp = await fetch(`/api/campaigns/${encodeURIComponent(id)}/launch`, { method: "POST" });
+        const resp = await fetch(`/api/campaigns/${encodeURIComponent(id)}/send`, { method: "POST" });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.detail || "Launch failed");
         showToast(data.message || "Campaign launched successfully!", "success", 6000);
@@ -2199,14 +2205,14 @@ async function generateCampaignPreviews(id) {
     container.innerHTML = `<div class="muted">Generating personalized previews...</div>`;
 
     try {
-        const resp = await fetch(`/api/campaigns/${encodeURIComponent(id)}/preview`);
-        const list = await resp.json();
+        const resp = await fetch(`/api/campaigns/${encodeURIComponent(id)}/preview`, { method: "POST" });
+        const data = await resp.json();
         if (!resp.ok) throw new Error("Could not load previews");
 
-        container.innerHTML = list.slice(0, 10).map((p, idx) => `
+        container.innerHTML = data.previews.slice(0, 10).map((p, idx) => `
             <div style="background: white; border: 1px solid var(--border-light); border-radius: var(--radius-md); padding: 16px;">
                 <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
-                    <span style="font-weight: 700; color: #2563eb;">Preview #${idx + 1} — To: ${escapeHtml(p.to_email)}</span>
+                    <span style="font-weight: 700; color: #2563eb;">Preview #${idx + 1} — To: ${escapeHtml(p.recipient_email)}</span>
                     <span class="muted" style="font-size: 12px;">Recipient: ${escapeHtml(p.recipient_name)}</span>
                 </div>
                 <div style="font-size: 13px; font-weight: 700; margin-bottom: 8px;">Subject: ${escapeHtml(p.subject)}</div>

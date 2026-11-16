@@ -20,6 +20,7 @@ from app.database import (
     get_all_contacts,
     get_contact_count,
     delete_contact,
+    delete_all_contacts,
     save_resume,
     get_resume,
     delete_resume,
@@ -87,6 +88,13 @@ initialize_database()
 # --------------------------------------------------
 # REQUEST MODELS
 # --------------------------------------------------
+
+class ContactInput(BaseModel):
+    name: str = Field(default="", max_length=150)
+    email: str = Field(min_length=3, max_length=254)
+    company: str = Field(default="", max_length=150)
+    job_role: str = Field(default="", max_length=150)
+
 
 class EmailTemplateInput(BaseModel):
     template_name: str = Field(min_length=1, max_length=100)
@@ -349,6 +357,28 @@ async def search_contacts(q: str = ""):
     return {"total_contacts": len(contacts), "contacts": contacts}
 
 
+@app.post("/api/contacts/manual")
+async def add_contact(data: ContactInput):
+    email = data.email.strip().lower()
+    if not EMAIL_PATTERN.fullmatch(email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    saved, _ = save_contacts([{
+        "name": data.name.strip(),
+        "email": email,
+        "company": data.company.strip(),
+        "job_role": data.job_role.strip(),
+    }])
+    if not saved:
+        raise HTTPException(status_code=409, detail="A contact with this email already exists.")
+    return {"message": "Contact added successfully."}
+
+
+@app.delete("/api/contacts")
+async def clear_contacts():
+    return {"deleted_count": delete_all_contacts()}
+
+
 @app.delete("/api/contacts/{contact_id}")
 async def remove_contact(contact_id: int):
     deleted = delete_contact(contact_id)
@@ -422,6 +452,9 @@ async def upload_contacts(file: UploadFile = File(...)):
         None,
     )
 
+    company_index = next((i for i, header in enumerate(headers) if header in ("company", "company name")), None)
+    role_index = next((i for i, header in enumerate(headers) if header in ("role", "job role")), None)
+
     contacts = []
     seen = set()
     invalid = 0
@@ -448,7 +481,12 @@ async def upload_contacts(file: UploadFile = File(...)):
         if name_index is not None and name_index < len(row):
             name = str(row[name_index] or "").strip()
 
-        contacts.append({"name": name, "email": email})
+        contacts.append({
+            "name": name,
+            "email": email,
+            "company": str(row[company_index] or "").strip() if company_index is not None and company_index < len(row) else "",
+            "job_role": str(row[role_index] or "").strip() if role_index is not None and role_index < len(row) else "",
+        })
 
     if not contacts:
         raise HTTPException(

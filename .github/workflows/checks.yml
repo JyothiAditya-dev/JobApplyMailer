@@ -67,3 +67,64 @@ jobs:
                       exchange.assert_called_once()
                       assert client.get(callback, params={"code": "test", "state": state}).status_code == 400
           PY
+      - run: python -m pip install playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: Exercise contacts, templates, resume, and campaign review in a browser
+        run: |
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/dashboard.log 2>&1 &
+          server=$!
+          trap 'kill "$server"; cat /tmp/dashboard.log' EXIT
+          for attempt in {1..30}; do
+            if curl --silent --fail http://127.0.0.1:8000/health > /dev/null; then break; fi
+            sleep 1
+          done
+          python - <<'PY'
+          from playwright.sync_api import expect, sync_playwright
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch()
+              page = browser.new_page()
+              errors = []
+              page.on("pageerror", lambda error: errors.append(str(error)))
+              page.route("https://fonts.googleapis.com/**", lambda route: route.abort())
+              page.goto("http://127.0.0.1:8000/")
+              page.evaluate("switchTab('contacts')")
+              page.get_by_role("button", name="Add Single").click()
+              page.locator("#manualName").fill("Test Recruiter")
+              page.locator("#manualEmail").fill("recruiter@example.com")
+              page.locator("#manualCompany").fill("Example")
+              page.get_by_role("button", name="Save Contact").click()
+              expect(page.locator("#contactsTableBody")).to_contain_text("recruiter@example.com")
+              expect(page.locator("#contactsTableBody")).to_contain_text("Example")
+
+              page.evaluate("switchTab('resume')")
+              expect(page.locator("#resumeUploadSection")).to_be_visible()
+              expect(page.locator("#activeResumeContainer")).to_be_hidden()
+              page.locator("#resumeFileInput").set_input_files(
+                  {"name": "resume.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4 fixture"}
+              )
+              expect(page.locator("#resumeOriginalName")).to_have_text("resume.pdf")
+
+              page.evaluate("switchTab('templates')")
+              page.locator("#templateNameInput").fill("Application")
+              page.locator("#templateSubjectInput").fill("Hello {{recruiter_name}}")
+              page.locator("#templateBodyInput").fill("A sample message.")
+              page.locator("#btnSaveTemplate").click()
+              expect(page.locator("#templatesTableBody")).to_contain_text("Application")
+
+              page.evaluate("switchTab('campaigns')")
+              page.get_by_role("button", name="Create New Campaign").click()
+              page.locator("#campaignNameField").fill("Smoke test campaign")
+              page.locator("#campaignTemplateSelect").select_option(index=1)
+              page.locator(".campaign-contact-chk").check()
+              page.locator("#btnCreateCampaign").click()
+              expect(page.locator("#campaignsTableBody")).to_contain_text("1 recipients")
+              expect(page.locator("#detailCampaignTitle")).to_contain_text("Smoke test campaign")
+
+              page.get_by_role("button", name="Approve", exact=True).click()
+              expect(page.locator("#detailRecipientsTable")).to_contain_text("approved")
+              page.get_by_role("button", name="Preview Emails").click()
+              expect(page.locator("#previewsListContainer")).to_contain_text("recruiter@example.com")
+              expect(page.locator("#previewsListContainer")).to_contain_text("Hello Test Recruiter")
+              assert not errors, errors
+          PY

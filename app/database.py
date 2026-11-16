@@ -29,9 +29,17 @@ def initialize_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT,
                 email TEXT NOT NULL UNIQUE,
+                company TEXT NOT NULL DEFAULT '',
+                job_role TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        contact_columns = {row["name"] for row in connection.execute("PRAGMA table_info(contacts)")}
+        if "company" not in contact_columns:
+            connection.execute("ALTER TABLE contacts ADD COLUMN company TEXT NOT NULL DEFAULT ''")
+        if "job_role" not in contact_columns:
+            connection.execute("ALTER TABLE contacts ADD COLUMN job_role TEXT NOT NULL DEFAULT ''")
 
         # Resumes table
         connection.execute("""
@@ -192,9 +200,9 @@ def save_contacts(contacts):
     with get_connection() as connection:
         for contact in contacts:
             cursor = connection.execute("""
-                INSERT OR IGNORE INTO contacts (name, email)
-                VALUES (?, ?)
-            """, (contact["name"], contact["email"]))
+                INSERT OR IGNORE INTO contacts (name, email, company, job_role)
+                VALUES (?, ?, ?, ?)
+            """, (contact["name"], contact["email"], contact.get("company", ""), contact.get("job_role", "")))
 
             if cursor.rowcount == 1:
                 saved_count += 1
@@ -208,14 +216,14 @@ def get_all_contacts(search=""):
     with get_connection() as connection:
         if search:
             rows = connection.execute("""
-                SELECT id, name, email, created_at
+                SELECT id, name, email, company, job_role, created_at
                 FROM contacts
                 WHERE name LIKE ? OR email LIKE ?
                 ORDER BY id DESC
             """, (f"%{search}%", f"%{search}%")).fetchall()
         else:
             rows = connection.execute("""
-                SELECT id, name, email, created_at
+                SELECT id, name, email, company, job_role, created_at
                 FROM contacts
                 ORDER BY id DESC
             """).fetchall()
@@ -229,6 +237,11 @@ def get_contact_count():
             "SELECT COUNT(*) FROM contacts"
         ).fetchone()
     return result[0]
+
+
+def delete_all_contacts():
+    with get_connection() as connection:
+        return connection.execute("DELETE FROM contacts").rowcount
 
 
 def delete_contact(contact_id):
